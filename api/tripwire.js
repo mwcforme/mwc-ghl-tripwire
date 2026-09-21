@@ -501,7 +501,7 @@ async function checkSendFailures() {
 
 /* --------------------------------------------------------------- blindness */
 
-const LEGS = ["platform", "wferrors", "executions", "estate", "dispatch", "capture", "sendfail"];
+const LEGS = ["platform", "wferrors", "executions", "estate", "capture"];
 
 async function checkBlindness(results) {
   for (const leg of LEGS) {
@@ -605,13 +605,16 @@ export default async function handler(req, res) {
   const t0 = Date.now();
   findings = []; // invocation-scoped: never carry findings across warm ticks
   const results = {};
+  // NOTE (2026-09-21, user correction): conversion + attribution are handled
+  // by Curve now. The old conversion_queue/conversion_sends signals
+  // (dispatch, sendfail) watched a DECOMMISSIONED path and paged falsely —
+  // removed. Capture (booking_attribution_records freshness) is kept: it
+  // watches the booking-app capture leg, not ad dispatch.
   results.platform = await checkPlatform();
   results.wferrors = await checkErrCount();
   results.executions = await checkExecutions();
   results.estate = await checkEstate();
-  results.dispatch = await checkDispatch();
   results.capture = await checkCapture();
-  results.sendfail = await checkSendFailures();
   await checkBlindness(results);
 
   let sent = [];
