@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "crons": [
+    {
+      "path": "/api/tripwire",
+      "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/deadman",
+      "schedule": "0 * * * *"
+    }
+  ]
+}
