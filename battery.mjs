@@ -1,123 +1,69 @@
 /**
- * Local battery for api/tripwire.js — verifies each check's evaluation logic,
- * the insert-first dedupe, the 6h repeat-cap re-arm, and the blindness legs,
- * against the REAL Supabase (read for state; inserts confined to ghl: keys)
- * with email disabled. Run: node battery.mjs
+ * Local battery for api/tripwire.js — RESCOPED 2026-09-21: conversion and
+ * attribution are owned by Curve; the dispatch/sendfail signals were removed
+ * (commit ecdbe24). Verifies, against the REAL Supabase with email disabled:
+ * all remaining legs ok on live data, no dispatch/sendfail legs remain,
+ * healthy estate -> no findings, no warm-container state carryover, dry mode
+ * writes/sends nothing, run marker fresh for the deadman.
+ * Run: node battery.mjs
  */
 import handler from "./api/tripwire.js";
-
-const env = {
-  SUPABASE_URL: process.env.SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY,
-  GHL_API_KEY: process.env.GHL_API_KEY,
-  GHL_LOCATION_ID: "Ghstz8eIsHWLeXek47dk",
-  CRON_SECRET: "", // no auth locally
-};
 
 const results = [];
 function check(name, cond, detail = "") {
   results.push([name, !!cond]);
   console.log((cond ? "PASS " : "FAIL ") + name + (cond ? "" : " :: " + detail));
 }
+const mkRes = () => ({ statusCode: 200, body: null, json(x) { this.body = x; } });
+const AUTH = process.env.CRON_SECRET ? { authorization: "Bearer " + process.env.CRON_SECRET } : {};
+delete process.env.GOOGLE_OAUTH_REFRESH_TOKEN; // email leg disabled locally
 
-function mockRes() {
-  return {
-    statusCode: 200,
-    body: null,
-    json(x) {
-      this.body = x;
-    },
-  };
-}
+const URL = process.env.SUPABASE_URL;
+const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const H = { apikey: KEY, Authorization: "Bearer " + KEY };
 
-// -- 1) healthy run against live data: legs report, findings only for the
-//       real known incident (dispatch), everything else suppressed by dedupe.
-process.env.SUPABASE_URL = env.SUPABASE_URL;
-process.env.SUPABASE_SERVICE_ROLE_KEY = env.SUPABASE_SERVICE_ROLE_KEY;
-process.env.GHL_API_KEY = env.GHL_API_KEY;
-process.env.GHL_LOCATION_ID = env.GHL_LOCATION_ID;
-delete process.env.CRON_SECRET;
-// no GOOGLE_OAUTH env -> email leg disabled locally (sent=false, logged)
-delete process.env.GOOGLE_OAUTH_REFRESH_TOKEN;
-
-const r1 = mockRes();
-await handler({ method: "GET", url: "/api/tripwire", headers: {} }, r1);
-const b1 = r1.body;
+const r1 = mkRes();
+await handler({ method: "GET", url: "/api/tripwire", headers: AUTH }, r1);
 console.log("\n--- run 1 (live data, no email) ---");
-console.log(JSON.stringify(b1, null, 1).slice(0, 1200));
+console.log(JSON.stringify(r1.body, null, 1).slice(0, 900));
 
-check("handler 200 + shape", b1 && Array.isArray(b1.findings) && b1.legs);
-check("platform leg ok (statuspage reachable)", b1?.legs?.platform === "ok", JSON.stringify(b1?.legs));
-check("wferrors leg ok (JWT mint works)", b1?.legs?.wferrors === "ok", JSON.stringify(b1?.legs));
-check("estate leg ok (PIT public read works)", b1?.legs?.estate === "ok", JSON.stringify(b1?.legs));
-check("dispatch leg ok (supabase read works)", b1?.legs?.dispatch === "ok", JSON.stringify(b1?.legs));
 check(
-  "live dispatch incident detected",
-  b1?.findings?.includes("dispatch"),
-  "findings=" + JSON.stringify(b1?.findings)
+  "all remaining legs ok",
+  r1.body?.legs && Object.values(r1.body.legs).every((v) => v === "ok"),
+  JSON.stringify(r1.body?.legs)
 );
-
-// -- 2) dedupe: second run on the same condition -> no second finding
-const r2 = mockRes();
-await handler({ method: "GET", url: "/api/tripwire", headers: {} }, r2);
-const b2 = r2.body;
 check(
-  "dedupe: same-condition second run silent",
-  !b2?.findings?.includes("dispatch"),
-  "findings=" + JSON.stringify(b2?.findings)
+  "no dispatch/sendfail legs remain (Curve owns conversion)",
+  r1.body?.legs?.dispatch === undefined && r1.body?.legs?.sendfail === undefined,
+  JSON.stringify(r1.body?.legs)
 );
+check("healthy estate -> no findings", (r1.body?.findings ?? []).length === 0, JSON.stringify(r1.body?.findings));
+check("no email sent locally", (r1.body?.alerts_sent ?? []).length === 0);
 
-// -- 3) repeat-cap re-arm: age the dispatch alert row past 6h, re-run -> fires again
-const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
-const key = "ghl:alert:dispatch:down";
-const past = new Date(Date.now() - 7 * 3.6e6).toISOString();
-const patchRes = await fetch(
-  `${SUPABASE_URL}/rest/v1/ops_alert_log?alert_key=eq.${encodeURIComponent(key)}`,
-  {
-    method: "PATCH",
-    headers: {
-      apikey: SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: "Bearer " + SUPABASE_SERVICE_ROLE_KEY,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ created_at: past }),
-  }
-);
-console.log("\n--- aged dispatch alert row to -7h (PATCH " + patchRes.status + ") ---");
-const r3 = mockRes();
-await handler({ method: "GET", url: "/api/tripwire", headers: {} }, r3);
-check(
-  "repeat-cap: aged condition re-pages once",
-  r3.body?.findings?.includes("dispatch"),
-  "findings=" + JSON.stringify(r3.body?.findings)
-);
-
-// -- 4) re-run again -> re-suppressed (fresh row now blocks)
-const r4 = mockRes();
-await handler({ method: "GET", url: "/api/tripwire", headers: {} }, r4);
-check(
-  "post-rearm dedupe holds",
-  !r4.body?.findings?.includes("dispatch"),
-  "findings=" + JSON.stringify(r4.body?.findings)
-);
-
-// -- 5) dry mode: evaluates, sends nothing, writes nothing
-const before = await fetch(
-  `${SUPABASE_URL}/rest/v1/ops_alert_log?select=alert_key&alert_key=like.ghl:*&order=created_at.desc&limit=50`,
-  { headers: { apikey: SUPABASE_SERVICE_ROLE_KEY, Authorization: "Bearer " + SUPABASE_SERVICE_ROLE_KEY } }
+const preDry = await fetch(
+  `${URL}/rest/v1/ops_alert_log?select=alert_key&alert_key=like.ghl:*&order=created_at.desc&limit=100`,
+  { headers: H }
 ).then((r) => r.json());
-const r5 = mockRes();
-await handler({ method: "GET", url: "/api/tripwire?dry=1", headers: {} }, r5);
-const after = await fetch(
-  `${SUPABASE_URL}/rest/v1/ops_alert_log?select=alert_key&alert_key=like.ghl:*&order=created_at.desc&limit=50`,
-  { headers: { apikey: SUPABASE_SERVICE_ROLE_KEY, Authorization: "Bearer " + SUPABASE_SERVICE_ROLE_KEY } }
+
+const r2 = mkRes();
+await handler({ method: "GET", url: "/api/tripwire", headers: AUTH }, r2);
+check("second run clean (no warm-container state carryover)", (r2.body?.findings ?? []).length === 0, JSON.stringify(r2.body?.findings));
+
+const r3 = mkRes();
+await handler({ method: "GET", url: "/api/tripwire?dry=1", headers: AUTH }, r3);
+const postDry = await fetch(
+  `${URL}/rest/v1/ops_alert_log?select=alert_key&alert_key=like.ghl:*&order=created_at.desc&limit=100`,
+  { headers: H }
 ).then((r) => r.json());
-check(
-  "dry mode writes nothing",
-  JSON.stringify(before) === JSON.stringify(after),
-  `before=${before.length} after=${after.length}`
-);
-check("dry mode sends no email", (r5.body?.alerts_sent ?? []).length === 0);
+check("dry mode writes nothing", JSON.stringify(preDry) === JSON.stringify(postDry));
+check("dry mode sends no email", (r3.body?.alerts_sent ?? []).length === 0);
+
+const markers = await fetch(
+  `${URL}/rest/v1/ops_alert_log?select=created_at&alert_key=like.ghl:state:run:*&order=created_at.desc&limit=1`,
+  { headers: H }
+).then((r) => r.json());
+const ageMin = markers.length ? (Date.now() - Date.parse(markers[0].created_at)) / 60000 : null;
+check("run marker fresh (<10 min, deadman dependency)", ageMin != null && ageMin < 10, "age=" + ageMin);
 
 console.log("\n=== BATTERY: " + results.filter((r) => r[1]).length + "/" + results.length + " passed ===");
 process.exit(results.some((r) => !r[1]) ? 1 : 0);
