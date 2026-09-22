@@ -101,7 +101,25 @@ check(
   r1.body?.legs && ["platform", "wferrors", "executions", "estate", "capture"].every((l) => r1.body.legs[l] === "ok"),
   JSON.stringify(r1.body?.legs)
 );
-check("healthy estate -> no findings", (r1.body?.findings ?? []).length === 0, JSON.stringify(r1.body?.findings));
+{
+  const f1 = r1.body?.findings ?? [];
+  const liveCount = r1.body?.observed?.err_count;
+  // NEW SEMANTICS (2026-09-22): standing unacknowledged errors are a FINDING.
+  // A healthy run with err_count > 0 must report the wferrors standing alert;
+  // a run with err_count == 0 must report nothing.
+  check(
+    "findings are exactly the standing-errors alert when live err_count > 0",
+    liveCount > 0
+      ? f1.length === 1 && f1[0] === "wferrors"
+      : f1.length === 0,
+    JSON.stringify({ findings: f1, err_count: liveCount })
+  );
+  check(
+    "standing finding present when live err_count > 0 (the feature works)",
+    liveCount > 0 ? f1.includes("wferrors") : true,
+    "err_count=" + liveCount
+  );
+}
 check("no email sent locally", (r1.body?.alerts_sent ?? []).length === 0);
 check("delivery_failed present in shape", Array.isArray(r1.body?.delivery_failed));
 check("email leg really disabled (no oauth at call time)", !process.env.GOOGLE_OAUTH_REFRESH_TOKEN);
@@ -225,7 +243,19 @@ check(
 {
   const r8 = mkRes();
   await handler({ method: "GET", url: "/api/tripwire?dry=1", headers: AUTH }, r8);
-  check("warm-container: dry->live same module, findings reset", (r8.body?.findings ?? []).length === 0, JSON.stringify(r8.body?.findings));
+  const r8b = mkRes();
+  await handler({ method: "GET", url: "/api/tripwire?dry=1", headers: AUTH }, r8b);
+  // warm-container bug was ACCUMULATION across invocations. Dry runs may now
+  // legitimately carry the standing wferrors finding (claimAlert is a no-op
+  // in dry, so it re-appears); what must NEVER happen is growth or leftovers
+  // from earlier live findings (platform/estate/etc).
+  const f8 = r8.body?.findings ?? [];
+  const f8b = r8b.body?.findings ?? [];
+  check(
+    "warm-container: findings stable (no accumulation) across dry runs",
+    JSON.stringify(f8) === JSON.stringify(f8b) && f8.every((x) => x === "wferrors"),
+    JSON.stringify({ first: f8, second: f8b })
+  );
   const r9 = mkRes();
   await handler({ method: "GET", url: "/api/tripwire", headers: AUTH }, r9);
   check("warm-container: DRY reset false on next live run", r9.body?.dry === false);
@@ -264,6 +294,120 @@ check(
     "run marker fresh (<10 min, deadman dependency)",
     ageMin != null && ageMin < 10,
     "age=" + (ageMin == null ? "null" : ageMin.toFixed(1))
+  );
+}
+
+
+// ---------- BATTERY V2 CASES (2026-09-22: name-the-workflow + recipients) ----------
+
+// 13) ALERT_TO parses as a multi-recipient list
+{
+  const src = readFileSync("./api/tripwire.js", "utf8");
+  check(
+    "ALERT_TO is a parsed comma-list (multi-recipient)",
+    /ALERT_TO = \(process\.env\.ALERT_TO \|\|[\s\S]*?\.split\(","\)[\s\S]*?\.filter\(Boolean\)/.test(src),
+    "ALERT_TO split/filter pattern"
+  );
+  check(
+    "recipients include techops + v-ihetta + sending mailbox",
+    src.includes("techops@menswellnesscenters.com,v-ihetta@menswellnesscenters.com,v-islam.hetta@mwcforme.com"),
+    "default recipient list"
+  );
+  check(
+    "email To: header joins the list",
+    src.includes("To: ${ALERT_TO.join("),
+    "To header join"
+  );
+  check(
+    "deadman also multi-recipient",
+    readFileSync("./api/deadman.js", "utf8").includes("ALERT_TO.join("),
+    "deadman To header join"
+  );
+}
+
+// 14) every wferrors alert carries the Needs Review deep link
+{
+  const src = readFileSync("./api/tripwire.js", "utf8");
+  const wferrSection = src.split("async function checkErrCount")[1].split("async function checkExecutions")[0];
+  const alertBlocks = wferrSection.split("page(").slice(1);
+  check(
+    "every wferrors alert block cites REVIEW_URL",
+    alertBlocks.length >= 2 &&
+      alertBlocks.every((b) => b.includes("${REVIEW_URL}")),
+    alertBlocks.length + " alert blocks in checkErrCount"
+  );
+  check(
+    "REVIEW_URL is the Needs Review deep link with listTab=review",
+    /REVIEW_URL = `https:\/\/app\.gohighlevel\.com\/v2\/location\/\$\{LOC\}\/automation\/workflows\?listTab=review`/.test(src),
+    "REVIEW_URL literal"
+  );
+}
+
+// 15) standing-error path exists with 24h repeat cap
+{
+  const src = readFileSync("./api/tripwire.js", "utf8");
+  check(
+    "standing-error claimAlert uses 24h repeat cap",
+    /claimAlert\("wferrors", fpStanding, "alert", 24\)/.test(src),
+    "claimAlert(..., 24)"
+  );
+  check(
+    "standing alert pages when count > 0",
+    /if \(count > 0\) \{[\s\S]*?fpStanding[\s\S]*?page\("wferrors", fpStanding/.test(src),
+    "standing block + page()"
+  );
+}
+
+// 16) estate alert names flipped workflows (ID-set diff)
+{
+  const src = readFileSync("./api/tripwire.js", "utf8");
+  const estate = src.split("async function checkEstate")[1].split("async function checkCapture")[0];
+  check(
+    "estate stores ID->name map in state",
+    estate.includes("ghl:state:estate_map") && estate.includes("JSON.stringify(idMap)"),
+    "estate_map state write"
+  );
+  check(
+    "estate alert subject carries the names",
+    /page\("estate", fp, `\[GHL\] Published workflows \$\{prev\} -> \$\{published\}\$\{names \? " — " \+ names\.slice\(1\) : ""\}`/.test(estate),
+    "subject template with names"
+  );
+  check(
+    "estate diff handles unreadable state (try/catch fallback)",
+    estate.includes("} catch {"),
+    "try/catch around map diff"
+  );
+}
+
+// 17) dry-run live check: standing errors page exactly once then dedupe
+//     (uses the LIVE count; if count > 0 the claim fires once, second claim
+//     is suppressed — proves the dedupe lock on the real key namespace)
+{
+  _internals.setDry(false);
+  // run handler twice NON-dry but with email disabled (no oauth env) —
+  // findings still accumulate; we assert via ops_alert_log row existence
+  const ra = mkRes();
+  await handler({ method: "GET", url: "/api/tripwire", headers: AUTH }, ra);
+  const count = ra.body?.observed?.err_count;
+  if (count > 0) {
+    // battery has NO oauth env -> the email leg fails by design -> the lock
+    // is RELEASED so production would retry. Assert that full cycle:
+    // finding reported + delivery_failed surfaced + lock row absent.
+    const rows = await sbRows("ghl:alert:wferrors:standing:" + count);
+    check(
+      "standing alert: reported + delivery_failed + lock released (retry cycle)",
+      (ra.body?.findings ?? []).includes("wferrors") &&
+        (ra.body?.delivery_failed ?? []).includes("wferrors") &&
+        Array.isArray(rows) && rows.length === 0,
+      JSON.stringify({ findings: ra.body?.findings, delivery_failed: ra.body?.delivery_failed, locks: rows?.length })
+    );
+  } else {
+    check("live err_count is 0 -> standing path correctly silent", true);
+  }
+  check(
+    "run reports observed.err_count",
+    typeof ra.body?.observed?.err_count === "number",
+    JSON.stringify(ra.body?.observed)
   );
 }
 

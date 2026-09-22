@@ -16,7 +16,11 @@
  */
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const ALERT_TO = process.env.ALERT_TO || "techops@menswellnesscenters.com";
+const ALERT_TO = (process.env.ALERT_TO ||
+  "techops@menswellnesscenters.com,v-ihetta@menswellnesscenters.com,v-islam.hetta@mwcforme.com")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 const ALERT_FROM = process.env.ALERT_FROM || "v-islam.hetta@mwcforme.com";
 const STALE_MIN = 20;
 
@@ -65,7 +69,7 @@ async function email(subject, text) {
   if (!token) { console.error(JSON.stringify({ event: "gmail_token_failed", subject })); return false; }
   const boundary = "mwc" + Date.now();
   const raw = [
-    `To: ${ALERT_TO}`,
+    `To: ${ALERT_TO.join(", ")}`,
     `From: ${ALERT_FROM}`,
     `Content-Type: multipart/alternative; boundary=${boundary}`,
     `Subject: ${subject}`,

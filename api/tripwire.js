@@ -12,7 +12,11 @@
  *  A  blindness      per-leg probe failures (2+ consecutive)          -> pages (1/h cap)
  *  B  platform       statuspage.io indicator != none                  -> pages
  *  C  wf errors      error-notification/count rise (Firebase JWT)     -> pages
+ *  C+ standing errs  count > 0 unacknowledged (re-pages daily)        -> pages
  *  D  wf err detail  error-notification/list rows (enriches C)        -> rides C
+ *     (NOTE 2026-09-22: D's list route returns 0 rows even when count>0;
+ *      GHL exposes NO per-workflow error detail via API — C/C+ alerts
+ *      therefore carry the Needs Review deep link, which does name them.)
  *  E  executions     /workflow/executions rows appear (canary)        -> pages
  *  G  capture        booking_attribution_records stale in biz hours   -> pages
  *  I  estate flip    published workflow count changes                 -> pages
@@ -49,8 +53,17 @@ const STATUSPAGE = "https://gohighlevel.statuspage.io/api/v2/status.json";
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
-const ALERT_TO = process.env.ALERT_TO || "techops@menswellnesscenters.com";
+const ALERT_TO = (process.env.ALERT_TO ||
+  "techops@menswellnesscenters.com,v-ihetta@menswellnesscenters.com,v-islam.hetta@mwcforme.com")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 const ALERT_FROM = process.env.ALERT_FROM || "v-islam.hetta@mwcforme.com";
+/** The ONLY surface that names failing workflows (verified 2026-09-22: the
+ *  error-notification/list route returns 0 rows whenever count > 0; 16 route
+ *  shapes probed — REST, Firestore, frontend bundles — none expose per-
+ *  workflow error detail. GHL's own digest email links here too.) */
+const REVIEW_URL = `https://app.gohighlevel.com/v2/location/${LOC}/automation/workflows?listTab=review`;
 
 // thresholds (mirror the locally-tested worker ghl_tripwire_watch.py)
 const T = {
@@ -325,7 +338,7 @@ async function sendFindingEmail(f) {
     return false;
   }
   const raw = [
-    `To: ${ALERT_TO}`,
+    `To: ${ALERT_TO.join(", ")}`,
     `From: ${ALERT_FROM}`,
     'Content-Type: multipart/alternative; boundary="mwcg"',
     `Subject: ${f.subject}`,
@@ -348,7 +361,7 @@ async function sendFindingEmail(f) {
     headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
     body: JSON.stringify({ raw: Buffer.from(raw).toString("base64url") }),
   });
-  log({ event: res.ok ? "alert_email_sent" : "alert_email_failed", subject: f.subject, status: res.status });
+  log({ event: res.ok ? "alert_email_sent" : "alert_email_failed", subject: f.subject, status: res.status, to: ALERT_TO.join(",") });
   return res.ok;
 }
 
@@ -385,6 +398,12 @@ async function checkPlatform() {
   return { ok: true, indicator: ind };
 }
 
+/** The error-notification LIST route returns 0 rows even while count > 0
+ *  (probed exhaustively 2026-09-22: 16 param shapes, Firestore, frontend
+ *  bundles — GHL exposes no per-workflow error detail to any API we can
+ *  auth to). So this alert cannot name the failing workflow itself; it
+ *  names the ONE surface that can — the Needs Review tab — via a direct
+ *  deep link. GHL's own 24h digest email links to the same page. */
 async function checkErrCount() {
   const r = await ghlInternal(`/workflow/${LOC}/error-notification/count`);
   if (!r.ok || !/^"?[0-9]+"?$/.test(String(r.body ?? ""))) return { ok: false };
@@ -397,9 +416,10 @@ async function checkErrCount() {
       const lr = await ghlInternal(
         `/workflow/error-notification/list?location_id=${LOC}&limit=10`
       );
+      // the list returns rows ONLY in the rare case GHL exposes them; today it is 0
       if (lr.ok && Array.isArray(lr.body?.rows) && lr.body.rows.length) {
         detail =
-          " Recent rows: " +
+          " Rows (if GHL exposes them): " +
           lr.body.rows
             .slice(0, 3)
             .map((row) => JSON.stringify(row).slice(0, 200))
@@ -411,9 +431,24 @@ async function checkErrCount() {
           `Workflow error notifications rose from ${prev} to ${count} in the last 5 minutes.`,
           "Impact: workflows failing execution — SMS/email/steps not running.",
           "Evidence: internal error-notification/count" + detail,
-          "Check: GHL Automation -> Workflows -> Needs Review tab.",
+          `Which workflow: GHL exposes no per-workflow error detail via API (verified 2026-09-22). Open the Needs Review tab — it lists every failing workflow by name: ${REVIEW_URL}`,
         ]);
       }
+    }
+  }
+  // STANDING errors: count > 0 nobody has acknowledged. Without this, errors
+  // that appear between deploys (or after a state reset) sit silent forever —
+  // the rise-detector only pages on a delta. Re-pages daily (24h cap) so a
+  // persisting error is not forgotten; recovers silently when acknowledged.
+  if (count > 0) {
+    const fpStanding = `standing:${count}`;
+    if (await claimAlert("wferrors", fpStanding, "alert", 24)) {
+      page("wferrors", fpStanding, `[GHL] ${count} workflow error${count === 1 ? "" : "s"} pending review (standing)`, [
+        `${count} workflow error notification${count === 1 ? " is" : "s are"} pending in GHL right now.`,
+        "Impact: a workflow is failing execution — SMS/email/steps not running for affected contacts.",
+        `Evidence: internal error-notification/count = ${count} (verified live).`,
+        `Which workflow: GHL exposes no per-workflow error detail via API (verified 2026-09-22). Open Needs Review — it lists every failing workflow by name: ${REVIEW_URL}`,
+      ]);
     }
   }
   await setState("ghl:state:err_count", count);
@@ -431,7 +466,7 @@ async function checkExecutions() {
       page("executions", fp, `[GHL] Executions surface returned ${n} rows (was always empty)`, [
         "The internal executions route started returning rows — new failure-signal surface.",
         `Evidence: /workflow/executions limit=10 -> ${n} rows.`,
-        "Check: review what GHL exposed; this is informational for tech ops.",
+        `Check: if these rows are execution errors, the failing workflows are listed by name in Needs Review: ${REVIEW_URL}`,
       ]);
     }
   }
@@ -439,27 +474,50 @@ async function checkExecutions() {
   return { ok: true, rows: n };
 }
 
+/** Estate flip with NAMING: stores the published ID->name map in state so the
+ *  alert says WHICH workflow appeared/vanished — the question this signal
+ *  exists to answer. Values live in the severity column (type: text, no
+ *  length cap — verified against the OpenAPI spec 2026-09-22). */
 async function checkEstate() {
   const r = await ghlPublic(`/workflows/?locationId=${LOC}`); // BARE params — limit 422s
   if (!r.ok || !Array.isArray(r.body?.workflows)) return { ok: false };
   const wfs = r.body.workflows;
-  const published = wfs.filter((w) => w.status === "published").length;
+  const pub = wfs.filter((w) => w.status === "published");
+  const published = pub.length;
+  const idMap = Object.fromEntries(pub.map((w) => [w.id, w.name]));
   const st = await getState("ghl:state:estate_published");
+  const stMap = await getState("ghl:state:estate_map");
   if (st) {
     const prev = parseInt(st.value, 10);
     if (!Number.isNaN(prev) && published !== prev) {
+      // diff the ID sets to NAME the flipped workflows
+      let names = "";
+      try {
+        const prevMap = JSON.parse(stMap?.value ?? "{}");
+        const prevIds = new Set(Object.keys(prevMap));
+        const nowIds = new Set(Object.keys(idMap));
+        const added = [...nowIds].filter((id) => !prevIds.has(id)).map((id) => idMap[id]);
+        const removed = [...prevIds].filter((id) => !nowIds.has(id)).map((id) => prevMap[id] ?? id);
+        const parts = [];
+        if (removed.length) parts.push("UNPUBLISHED/DELETED: " + removed.join(", "));
+        if (added.length) parts.push("NEWLY PUBLISHED: " + added.join(", "));
+        if (parts.length) names = " " + parts.join(" | ");
+      } catch {
+        // state unreadable -> fall back to count-only alert (names stay empty)
+      }
       const fp = `${prev}-${published}`;
       if (await claimAlert("estate", fp, "alert")) {
-        page("estate", fp, `[GHL] Published workflows ${prev} -> ${published}`, [
-          `The live published-workflow count changed (${prev} -> ${published}; total ${wfs.length}).`,
+        page("estate", fp, `[GHL] Published workflows ${prev} -> ${published}${names ? " — " + names.slice(1) : ""}`, [
+          `The live published-workflow count changed (${prev} -> ${published}; total ${wfs.length}).${names}`,
           "Impact: a production automation was published, unpublished, or deleted.",
-          "Evidence: public /workflows list, status split.",
+          "Evidence: public /workflows list, status split, ID-set diff vs stored baseline.",
           "Check: GHL Automation -> Workflows; verify the change was intentional.",
         ]);
       }
     }
   }
   await setState("ghl:state:estate_published", published);
+  await setState("ghl:state:estate_map", JSON.stringify(idMap));
   return { ok: true, published, total: wfs.length };
 }
 
