@@ -9,24 +9,37 @@
  * Signals (each route verified live before wiring — see the sentinel skill
  * ghl-error-tripwire / references/signal-verification-2026-09-21.md):
  *
- *  A  blindness      per-leg probe failures (2+ consecutive)          -> pages
+ *  A  blindness      per-leg probe failures (2+ consecutive)          -> pages (1/h cap)
  *  B  platform       statuspage.io indicator != none                  -> pages
  *  C  wf errors      error-notification/count rise (Firebase JWT)     -> pages
  *  D  wf err detail  error-notification/list rows (enriches C)        -> rides C
  *  E  executions     /workflow/executions rows appear (canary)        -> pages
- *  F  dispatch       conversion_queue all-skipped + arrivals fresh    -> pages
  *  G  capture        booking_attribution_records stale in biz hours   -> pages
- *  H  send failures  conversion_sends response_status != 200          -> pages
  *  I  estate flip    published workflow count changes                 -> pages
  *
- * Statelessness: serverless invocations share nothing, so ALL state lives in
- * Supabase — ops_alert_log rows are the dedupe lock AND the run ledger:
- *   ghl:run:<ISO-minutes>  — one per invocation (liveness/eyes check)
- *   ghl:state:<key>        — observed baselines (err_count, estate, legs)
- *   ghl:alert:<check>:<fp> — insert-first lock per condition instance
+ * REMOVED 2026-09-21 (user correction): F dispatch + H sendfail — Curve
+ * owns conversion/attribution now; the old conversion_queue/conversion_sends
+ * path is decommissioned BY DESIGN and must never be reported as an outage.
  *
- * Auth: CRON_SECRET bearer (Vercel cron sends it). ?dry=1 evaluates and
- * reports without sending email or writing anything.
+ * Statelessness: serverless invocations share warm containers, so runtime
+ * state (findings, DRY) is reset at the top of every invocation and ALL
+ * durable state lives in Supabase — ops_alert_log rows are the dedupe lock
+ * AND the run ledger:
+ *   ghl:state:run:<epoch-5min-bucket> — one per non-dry invocation (deadman)
+ *   ghl:state:<key>                   — observed baselines (err_count, estate, legs)
+ *   ghl:alert:<check>:<fp>            — insert-first lock per condition instance
+ *
+ * Auth: FAIL-CLOSED. CRON_SECRET must be configured and presented as
+ * "Authorization: Bearer <secret>" — header only (no query-param form, it
+ * would leak into access logs). Missing secret -> 500, wrong/absent header
+ * -> 401.
+ *
+ * dry mode: ?dry=1 evaluates and reports WITHOUT sending email or writing
+ * ANYTHING — no alert locks, no state mutation, no run marker.
+ *
+ * Delivery hardening: a finding whose email fails to send is surfaced in
+ * the response as delivery_failed[] and its dedupe lock is RELEASED, so
+ * the next run retries instead of silently muting the condition for 6h.
  */
 
 const LOC = process.env.GHL_LOCATION_ID || "Ghstz8eIsHWLeXek47dk";
@@ -41,14 +54,9 @@ const ALERT_FROM = process.env.ALERT_FROM || "v-islam.hetta@mwcforme.com";
 
 // thresholds (mirror the locally-tested worker ghl_tripwire_watch.py)
 const T = {
-  DISPATCH_STALL_H: 6,
-  DISPATCH_ARRIVAL_H: 2,
-  SEND_STALE_H: 36,
   CAPTURE_STALE_H: 24,
   LEG_FAIL_ALERT_MIN: 60, // max one blindness email per leg per hour
   REPEAT_CAP_H: 6, // same condition instance re-pages at most 6h
-  QUEUE_WINDOW: 60,
-  SEND_WINDOW: 100,
   BIZ: { startHour: 8, endHour: 18 }, // America/New_York Mon-Fri
 };
 
@@ -58,14 +66,21 @@ const SUPABASE_KEY =
 const GHL_PIT = process.env.GHL_API_KEY || "";
 const FIREBASE_REFRESH = process.env.GHL_FIREBASE_REFRESH_TOKEN || "";
 const FIREBASE_API_KEY = process.env.GHL_FIREBASE_API_KEY || "";
-const GOOGLE_OAUTH = process.env.GOOGLE_OAUTH_REFRESH_TOKEN
-  ? {
-      refresh: process.env.GOOGLE_OAUTH_REFRESH_TOKEN,
-      clientId: process.env.GOOGLE_OAUTH_CLIENT_ID,
-      clientSecret: process.env.GOOGLE_OAUTH_CLIENT_SECRET,
-      tokenUri: process.env.GOOGLE_OAUTH_TOKEN_URI,
-    }
-  : null;
+
+/** OAuth quartet read at CALL time, never at module scope — a battery or
+ *  local run that deletes the env BEFORE import must be able to disable the
+ *  email leg (module-scope capture + ESM import hoisting defeated that in
+ *  the pre-2026-09-22 battery: it sent real mail while "disabled"). */
+function googleOAuth() {
+  return process.env.GOOGLE_OAUTH_REFRESH_TOKEN
+    ? {
+        refresh: process.env.GOOGLE_OAUTH_REFRESH_TOKEN,
+        clientId: process.env.GOOGLE_OAUTH_CLIENT_ID,
+        clientSecret: process.env.GOOGLE_OAUTH_CLIENT_SECRET,
+        tokenUri: process.env.GOOGLE_OAUTH_TOKEN_URI,
+      }
+    : null;
+}
 
 /* ------------------------------------------------------------------ utils */
 
@@ -103,17 +118,19 @@ function ageH(ms) {
   return ms == null ? null : (Date.now() - ms) / 3.6e6;
 }
 
-function bizHoursNow() {
+/** Business-hours gate: America/New_York Mon-Fri, 08:00 <= hour < 18:00.
+ *  Saturday (dow 6) is NOT a business day — a quiet weekend must not page. */
+function bizHoursNow(now = new Date()) {
   const fmt = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/New_York",
     hour12: false,
     weekday: "short",
     hour: "2-digit",
   });
-  const parts = Object.fromEntries(fmt.formatToParts(new Date()).map((p) => [p.type, p.value]));
-  const dow = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[parts.weekday] ?? 1;
+  const parts = Object.fromEntries(fmt.formatToParts(now).map((p) => [p.type, p.value]));
+  const dow = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[parts.weekday] ?? 0;
   const hour = Number(parts.hour);
-  return dow > 0 && hour >= T.BIZ.startHour && hour < T.BIZ.endHour;
+  return dow >= 1 && dow <= 5 && hour >= T.BIZ.startHour && hour < T.BIZ.endHour;
 }
 
 /* -------------------------------------------------------------- supabase */
@@ -138,16 +155,23 @@ function sb() {
   };
 }
 
+/** DRY is invocation-scoped: set at the top of every handler run so warm
+ *  containers never leak a previous tick's mode into this one. */
+let DRY = false;
+
 /**
  * Insert-first dedupe lock against ops_alert_log (unique alert_key).
  *
  * Returns true when THIS invocation may send the email:
  *   - insert succeeds  -> fresh condition instance, send
  *   - insert fails     -> already alerted. BUT if the existing row is older
- *                         than REPEAT_CAP_H, delete it and re-insert so a
- *                         persisting condition re-pages at most every 6h.
+ *                         than repeatCapH, delete it and re-insert so a
+ *                         persisting condition re-pages at most every cap
+ *                         window (6h standard, 1h for blind legs).
+ * In dry mode: reports "claimed" WITHOUT writing anything.
  */
-async function claimAlert(check, fp, severity) {
+async function claimAlert(check, fp, severity, repeatCapH = T.REPEAT_CAP_H) {
+  if (DRY) return true;
   const key = `ghl:alert:${check}:${fp}`;
   const ins = await sb().post("ops_alert_log", {
     alert_key: key,
@@ -160,7 +184,7 @@ async function claimAlert(check, fp, severity) {
     `ops_alert_log?select=created_at&alert_key=eq.${encodeURIComponent(key)}&limit=1`
   );
   const at = st.ok && Array.isArray(st.body) && st.body[0]?.created_at ? tsMs(st.body[0].created_at) : null;
-  if (at != null && Date.now() - at > T.REPEAT_CAP_H * 3.6e6) {
+  if (at != null && Date.now() - at > repeatCapH * 3.6e6) {
     // re-arm: delete the stale row, re-insert, send
     await jfetch(
       `${SUPABASE_URL}/rest/v1/ops_alert_log?alert_key=eq.${encodeURIComponent(key)}`,
@@ -182,9 +206,27 @@ async function claimAlert(check, fp, severity) {
   return false;
 }
 
+/** Release a claimed lock after a FAILED delivery, so the next run retries
+ *  instead of muting the condition for the repeat-cap window. */
+async function releaseAlert(check, fp) {
+  const key = `ghl:alert:${check}:${fp}`;
+  const res = await jfetch(
+    `${SUPABASE_URL}/rest/v1/ops_alert_log?alert_key=eq.${encodeURIComponent(key)}`,
+    {
+      method: "DELETE",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: "Bearer " + SUPABASE_KEY,
+      },
+    }
+  );
+  log({ event: "alert_lock_released", check, status: res.status });
+}
+
 /** Generic state upsert via ops_alert_log rows (value stored in severity).
- *  Insert-first; on duplicate key, PATCH the value in place. */
+ *  Insert-first; on duplicate key, PATCH the value in place. No-op in dry. */
 async function setState(key, value) {
+  if (DRY) return true;
   const ins = await sb().post("ops_alert_log", {
     alert_key: key,
     check_id: "ghl_state",
@@ -256,20 +298,14 @@ async function ghlPublic(path) {
 
 /* ----------------------------------------------------------------- email */
 
-async function sendAlertEmail(subject, lines) {
-  if (GOOGLE_OAUTH) return sendViaGmail(subject, lines);
-  log({ event: "email_skip_no_oauth" });
-  return false;
-}
-
-async function gmailAccessToken() {
+async function gmailAccessToken(OA) {
   const body = new URLSearchParams({
-    refresh_token: GOOGLE_OAUTH.refresh,
-    client_id: GOOGLE_OAUTH.clientId,
-    client_secret: GOOGLE_OAUTH.clientSecret,
+    refresh_token: OA.refresh,
+    client_id: OA.clientId,
+    client_secret: OA.clientSecret,
     grant_type: "refresh_token",
   }).toString();
-  const res = await jfetch(GOOGLE_OAUTH.tokenUri, {
+  const res = await jfetch(OA.tokenUri, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body,
@@ -277,26 +313,34 @@ async function gmailAccessToken() {
   return res.ok ? res.body.access_token : null;
 }
 
-async function sendViaGmail(subject, lines) {
-  const token = await gmailAccessToken();
-  if (!token) {
-    log({ event: "gmail_token_failed" });
+async function sendFindingEmail(f) {
+  const OA = googleOAuth();
+  if (!OA) {
+    log({ event: "email_skip_no_oauth", subject: f.subject });
     return false;
   }
-  const boundary = "mwcb" + Date.now();
-  const text = lines.join("\n");
+  const token = await gmailAccessToken(OA);
+  if (!token) {
+    log({ event: "gmail_token_failed", subject: f.subject });
+    return false;
+  }
   const raw = [
     `To: ${ALERT_TO}`,
     `From: ${ALERT_FROM}`,
-    "Content-Type: multipart/alternative; boundary=" + boundary,
-    `Subject: ${subject}`,
+    'Content-Type: multipart/alternative; boundary="mwcg"',
+    `Subject: ${f.subject}`,
     "",
-    "--" + boundary,
-    "Content-Type: text/plain; charset=UTF-8",
+    "--mwcg",
+    'Content-Type: text/html; charset=UTF-8',
     "",
-    text,
+    buildHtml(f),
     "",
-    "--" + boundary + "--",
+    "--mwcg",
+    'Content-Type: text/plain; charset=UTF-8',
+    "",
+    f.lines.join("\n"),
+    "",
+    "--mwcg--",
     "",
   ].join("\r\n");
   const res = await jfetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
@@ -304,8 +348,7 @@ async function sendViaGmail(subject, lines) {
     headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
     body: JSON.stringify({ raw: Buffer.from(raw).toString("base64url") }),
   });
-  if (res.ok) log({ event: "email_sent", subject, id: res.body?.id });
-  else log({ event: "email_failed", status: res.status, text: String(res.text).slice(0, 120) });
+  log({ event: res.ok ? "alert_email_sent" : "alert_email_failed", subject: f.subject, status: res.status });
   return res.ok;
 }
 
@@ -315,8 +358,8 @@ let findings = []; // RESET at the start of every invocation — warm containers
 // reuse module state between cron ticks, and an unreset array would
 // re-page every past finding forever (caught by battery.mjs run-2).
 
-function page(check, subject, lines) {
-  findings.push({ check, subject, lines });
+function page(check, fp, subject, lines) {
+  findings.push({ check, fp, subject, lines });
 }
 
 async function checkPlatform() {
@@ -328,6 +371,7 @@ async function checkPlatform() {
     if (await claimAlert("platform", fp, "alert")) {
       page(
         "platform",
+        fp,
         `[GHL] Platform status: ${ind.toUpperCase()}`,
         [
           `GHL's own status page reports: ${ind} — ${r.body?.status?.description ?? "?"}.`,
@@ -361,8 +405,9 @@ async function checkErrCount() {
             .map((row) => JSON.stringify(row).slice(0, 200))
             .join(" | ");
       }
-      if (await claimAlert("wferrors", `${prev}-${count}`, "alert")) {
-        page("wferrors", `[GHL] Workflow errors +${count - prev} (${prev} -> ${count})`, [
+      const fp = `${prev}-${count}`;
+      if (await claimAlert("wferrors", fp, "alert")) {
+        page("wferrors", fp, `[GHL] Workflow errors +${count - prev} (${prev} -> ${count})`, [
           `Workflow error notifications rose from ${prev} to ${count} in the last 5 minutes.`,
           "Impact: workflows failing execution — SMS/email/steps not running.",
           "Evidence: internal error-notification/count" + detail,
@@ -380,16 +425,17 @@ async function checkExecutions() {
   if (!r.ok || !Array.isArray(r.body)) return { ok: false };
   const n = r.body.length;
   const st = await getState("ghl:state:executions");
-  if (n > 0 && st?.value !== `rows:${n}`) {
-    if (await claimAlert("executions", `rows:${n}`, "warn")) {
-      page("executions", `[GHL] Executions surface returned ${n} rows (was always empty)`, [
+  const fp = `rows:${n}`;
+  if (n > 0 && st?.value !== fp) {
+    if (await claimAlert("executions", fp, "warn")) {
+      page("executions", fp, `[GHL] Executions surface returned ${n} rows (was always empty)`, [
         "The internal executions route started returning rows — new failure-signal surface.",
         `Evidence: /workflow/executions limit=10 -> ${n} rows.`,
         "Check: review what GHL exposed; this is informational for tech ops.",
       ]);
     }
   }
-  await setState("ghl:state:executions", `rows:${n}`);
+  await setState("ghl:state:executions", fp);
   return { ok: true, rows: n };
 }
 
@@ -402,8 +448,9 @@ async function checkEstate() {
   if (st) {
     const prev = parseInt(st.value, 10);
     if (!Number.isNaN(prev) && published !== prev) {
-      if (await claimAlert("estate", `${prev}-${published}`, "alert")) {
-        page("estate", `[GHL] Published workflows ${prev} -> ${published}`, [
+      const fp = `${prev}-${published}`;
+      if (await claimAlert("estate", fp, "alert")) {
+        page("estate", fp, `[GHL] Published workflows ${prev} -> ${published}`, [
           `The live published-workflow count changed (${prev} -> ${published}; total ${wfs.length}).`,
           "Impact: a production automation was published, unpublished, or deleted.",
           "Evidence: public /workflows list, status split.",
@@ -414,44 +461,6 @@ async function checkEstate() {
   }
   await setState("ghl:state:estate_published", published);
   return { ok: true, published, total: wfs.length };
-}
-
-async function checkDispatch() {
-  const r = await sb().get(
-    `conversion_queue?select=status,destination,created_at&order=created_at.desc&limit=${T.QUEUE_WINDOW}`
-  );
-  if (!r.ok || !Array.isArray(r.body) || !r.body.length) return { ok: false };
-  const newestAge = ageH(tsMs(r.body[0].created_at));
-  const nonskip = r.body.find((row) => row.status !== "skipped");
-  const lastOkAge = nonskip ? ageH(tsMs(nonskip.created_at)) : null;
-  if ((lastOkAge == null || lastOkAge > T.DISPATCH_STALL_H) && newestAge != null && newestAge < T.DISPATCH_ARRIVAL_H) {
-    // corroborate with sends staleness
-    const s = await sb().get(
-      `conversion_sends?select=destination,created_at&order=created_at.desc&limit=200`
-    );
-    let stale = "";
-    if (s.ok && Array.isArray(s.body)) {
-      const byDest = {};
-      for (const row of s.body) byDest[row.destination] ??= row.created_at;
-      const parts = [];
-      for (const [d, t] of Object.entries(byDest)) {
-        const a = ageH(tsMs(t));
-        if (a != null && a > T.SEND_STALE_H) parts.push(`${d} ${a.toFixed(0)}h`);
-      }
-      if (parts.length) stale = " Stale ad-platform sends: " + parts.join(", ") + ".";
-    }
-    if (await claimAlert("dispatch", "down", "alert")) {
-      page("dispatch", "[MWC] GHL conversion dispatch DOWN — all queue rows skipped", [
-        `Every conversion_queue row in the last ${T.QUEUE_WINDOW} has status='skipped' (last successful send: ${
-          nonskip ? nonskip.created_at : "none in window"
-        }) while new rows keep arriving (${newestAge.toFixed(1)}h old).${stale}`,
-        "Impact: Google/Meta/Microsoft/TikTok conversion APIs receive NOTHING — ad bidding runs blind.",
-        "Evidence: Supabase conversion_queue newest 60 rows, all skipped.",
-        "Check: the dispatcher skip gate — queue rows are created but never sent (mwc-admin conversion ops).",
-      ]);
-    }
-  }
-  return { ok: true, lastOkAge, newestAge };
 }
 
 async function checkCapture() {
@@ -468,7 +477,7 @@ async function checkCapture() {
   }
   if (worst > T.CAPTURE_STALE_H && bizHoursNow()) {
     if (await claimAlert("capture", "stale", "alert")) {
-      page("capture", "[MWC] Booking capture pipeline DOWN — no attribution events", [
+      page("capture", "stale", "[MWC] Booking capture pipeline DOWN — no attribution events", [
         `No booking attribution events (portal_booking / track_*) for ${worst.toFixed(1)}h during US business hours.`,
         "Impact: bookings/forms are not being captured at all — leads lost.",
         "Evidence: Supabase booking_attribution_records newest per event.",
@@ -477,26 +486,6 @@ async function checkCapture() {
     }
   }
   return { ok: true, worstAgeH: worst };
-}
-
-async function checkSendFailures() {
-  const r = await sb().get(
-    `conversion_sends?select=destination,response_status,created_at&order=created_at.desc&limit=${T.SEND_WINDOW}`
-  );
-  if (!r.ok || !Array.isArray(r.body)) return { ok: false };
-  const bad = r.body.filter((row) => row.response_status != null && String(row.response_status) !== "200");
-  if (bad.length) {
-    const fp = `${bad.length}|${bad[0].created_at}|${bad[0].destination}`;
-    if (await claimAlert("sendfail", fp, "alert")) {
-      page("sendfail", `[MWC] Conversion send failures — ${bad.length} of last ${r.body.length} non-200`, [
-        `${bad.length} of the last ${r.body.length} sends to ad platforms returned non-200 (newest: ${bad[0].created_at} dest=${bad[0].destination} status=${bad[0].response_status}).`,
-        "Impact: rejected/failed CAPI events — conversions not counted by ad platforms.",
-        "Evidence: Supabase conversion_sends response_status distribution.",
-        "Check: dispatcher error handling + platform API status (conversion ops).",
-      ]);
-    }
-  }
-  return { ok: true, bad: bad.length };
 }
 
 /* --------------------------------------------------------------- blindness */
@@ -516,8 +505,9 @@ async function checkBlindness(results) {
     const next = fails + 1;
     await setState(key, String(next));
     if (next >= 2) {
-      if (await claimAlert("blind", leg, "warn")) {
-        page("blind", `[GHL tripwire] Signal BLIND: '${leg}' failing ${next} runs`, [
+      // blind legs re-page at most once per hour (LEG_FAIL_ALERT_MIN)
+      if (await claimAlert("blind", leg, "warn", T.LEG_FAIL_ALERT_MIN / 60)) {
+        page("blind", leg, `[GHL tripwire] Signal BLIND: '${leg}' failing ${next} runs`, [
           `The '${leg}' detection leg has failed ${next} consecutive runs — this signal is unwatched until it recovers.`,
           "Impact: errors of this class go undetected while blind (the eyes themselves need checking).",
           "Evidence: probe status recorded per run in ops_alert_log state keys.",
@@ -552,49 +542,31 @@ function buildHtml(f) {
 </div>`;
 }
 
-async function sendFindingEmail(f) {
-  if (!GOOGLE_OAUTH) return false;
-  const token = await gmailAccessToken();
-  if (!token) return false;
-  const raw = [
-    `To: ${ALERT_TO}`,
-    `From: ${ALERT_FROM}`,
-    'Content-Type: multipart/alternative; boundary="mwcg"',
-    `Subject: ${f.subject}`,
-    "",
-    "--mwcg",
-    'Content-Type: text/html; charset=UTF-8',
-    "",
-    buildHtml(f),
-    "",
-    "--mwcg",
-    'Content-Type: text/plain; charset=UTF-8',
-    "",
-    f.lines.join("\n"),
-    "",
-    "--mwcg--",
-    "",
-  ].join("\r\n");
-  const res = await jfetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
-    method: "POST",
-    headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
-    body: JSON.stringify({ raw: Buffer.from(raw).toString("base64url") }),
-  });
-  log({ event: res.ok ? "alert_email_sent" : "alert_email_failed", subject: f.subject, status: res.status });
-  return res.ok;
+/** Guard a single check so one leg's crash (timeout, bad payload) reads as a
+ *  BLIND leg instead of killing the whole run — a 500 here would skip the
+ *  run marker and make the deadman false-page "cron not firing". */
+async function guard(name, fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    const err = String(e?.message ?? e).slice(0, 160);
+    log({ event: "check_exception", check: name, err });
+    return { ok: false, error: err };
+  }
 }
 
 export default async function handler(req, res) {
+  // Auth: fail-closed, header-only bearer. No query-param secret form.
   const secret = process.env.CRON_SECRET;
-  if (secret) {
-    const auth = req.headers.authorization || "";
-    const provided = new URL(req.url, "http://x").searchParams.get("secret") || auth;
-    if (provided !== `Bearer ${secret}` && provided !== secret) {
-      res.statusCode = 401;
-      return res.json({ error: "unauthorized" });
-    }
+  if (!secret) {
+    log({ event: "config_missing", need: "CRON_SECRET" });
+    res.statusCode = 500;
+    return res.json({ error: "cron secret not configured" });
   }
-  const dry = new URL(req.url, "http://x").searchParams.get("dry") === "1";
+  if ((req.headers.authorization || "") !== `Bearer ${secret}`) {
+    res.statusCode = 401;
+    return res.json({ error: "unauthorized" });
+  }
 
   if (!SUPABASE_URL || !SUPABASE_KEY) {
     log({ event: "config_missing", need: "SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY" });
@@ -602,26 +574,45 @@ export default async function handler(req, res) {
     return res.json({ error: "supabase env missing" });
   }
 
+  const dry = new URL(req.url, "http://x").searchParams.get("dry") === "1";
+
   const t0 = Date.now();
   findings = []; // invocation-scoped: never carry findings across warm ticks
+  DRY = dry; // invocation-scoped: never carry mode across warm ticks
   const results = {};
-  // NOTE (2026-09-21, user correction): conversion + attribution are handled
-  // by Curve now. The old conversion_queue/conversion_sends signals
-  // (dispatch, sendfail) watched a DECOMMISSIONED path and paged falsely —
-  // removed. Capture (booking_attribution_records freshness) is kept: it
-  // watches the booking-app capture leg, not ad dispatch.
-  results.platform = await checkPlatform();
-  results.wferrors = await checkErrCount();
-  results.executions = await checkExecutions();
-  results.estate = await checkEstate();
-  results.capture = await checkCapture();
-  await checkBlindness(results);
+  results.platform = await guard("platform", checkPlatform);
+  results.wferrors = await guard("wferrors", checkErrCount);
+  results.executions = await guard("executions", checkExecutions);
+  results.estate = await guard("estate", checkEstate);
+  results.capture = await guard("capture", checkCapture);
+  try {
+    await checkBlindness(results);
+  } catch (e) {
+    log({ event: "blindness_exception", err: String(e?.message ?? e).slice(0, 160) });
+  }
 
   let sent = [];
+  let deliveryFailed = [];
   if (!dry) {
     for (const f of findings) {
-      const ok = await sendFindingEmail(f);
-      if (ok) sent.push(f.check);
+      let ok = false;
+      try {
+        ok = await sendFindingEmail(f);
+      } catch (e) {
+        log({ event: "email_exception", check: f.check, err: String(e?.message ?? e).slice(0, 160) });
+      }
+      if (ok) {
+        sent.push(f.check);
+      } else {
+        // Delivery failed: surface it AND release the lock so the next run
+        // retries — a lost page must never mute the condition for 6h.
+        deliveryFailed.push(f.check);
+        try {
+          await releaseAlert(f.check, f.fp);
+        } catch (e) {
+          log({ event: "release_failed", check: f.check, err: String(e?.message ?? e).slice(0, 160) });
+        }
+      }
     }
   }
 
@@ -630,14 +621,20 @@ export default async function handler(req, res) {
     legs: Object.fromEntries(LEGS.map((l) => [l, results[l]?.ok ? "ok" : "FAIL"])),
     findings: findings.map((f) => f.check),
     sent,
+    delivery_failed: deliveryFailed,
     dry,
     ms: Date.now() - t0,
   });
 
   // Run marker for the dead-man's switch (api/deadman.js): one row per 5-min
-  // bucket; insert-first dedupes retries. dry mode writes nothing.
+  // bucket; insert-first dedupes retries. dry mode writes nothing. A marker
+  // write failure is LOUD (logged) — the deadman will catch it within 20 min.
   if (!dry) {
-    await setState(`ghl:state:run:${Math.floor(Date.now() / 300000)}`, "run");
+    try {
+      await setState(`ghl:state:run:${Math.floor(Date.now() / 300000)}`, "run");
+    } catch (e) {
+      log({ event: "marker_write_failed", err: String(e?.message ?? e).slice(0, 160) });
+    }
   }
 
   res.statusCode = 200;
@@ -648,14 +645,23 @@ export default async function handler(req, res) {
       err_count: results.wferrors?.count,
       estate_published: results.estate?.published,
       estate_total: results.estate?.total,
-      dispatch_last_ok_age_h: results.dispatch?.lastOkAgeH,
-      dispatch_newest_age_h: results.dispatch?.newestAgeH,
       capture_worst_age_h: results.capture?.worstAgeH,
-      sendfail_bad: results.sendfail?.bad,
     },
     findings: findings.map((f) => f.check),
     alerts_sent: sent,
+    delivery_failed: deliveryFailed,
     dry,
     ms: Date.now() - t0,
   });
 }
+
+/** Test seams for battery.mjs (named exports — ignored by Vercel's handler
+ *  resolution, which only consumes the default export). */
+export const _internals = {
+  claimAlert,
+  releaseAlert,
+  setState,
+  getState,
+  bizHoursNow,
+  setDry: (v) => (DRY = v),
+};
