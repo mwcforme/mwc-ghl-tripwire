@@ -8,6 +8,10 @@
     {
       "path": "/api/deadman",
       "schedule": "0 * * * *"
+    },
+    {
+      "path": "/api/meta-workflows",
+      "schedule": "*/5 * * * *"
     }
   ]
 }

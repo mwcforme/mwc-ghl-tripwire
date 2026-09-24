@@ -18,6 +18,7 @@ const mkRes = () => ({ statusCode: 200, body: null, json(x) { this.body = x; } }
 
 // env teardown BEFORE dynamic import (no module-scope OAuth capture in deadman either)
 import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 
 const OAUTH_KEYS = [
   "GOOGLE_OAUTH_REFRESH_TOKEN",
@@ -77,6 +78,73 @@ check("computeStale: fresh (5 min) -> not stale", computeStale(Date.now() - 5 * 
   check("fresh marker -> silent", r1.body?.paged === false && r1.body?.ok === true, JSON.stringify(r1.body));
   const del = await fetch(`${BASE}?alert_key=eq.${encodeURIComponent(key)}`, { method: "DELETE", headers: H });
   check("battery marker cleaned", del.status === 204 || del.status === 200, "delete " + del.status);
+}
+
+// ---------- 3b) multi-watch deadman (2026-09-24 META guard extension) ----------
+{
+  // Deterministic: point the dead-man at battery-owned marker prefixes via
+  // the DEADMAN_WATCHES seam — the deployed 5-min crons keep writing fresh
+  // ghl:* markers mid-test, so the real prefixes cannot stage a stale case.
+  const p1 = `ghl:meta:state:run:batteryA-${Date.now()}`;
+  const p2 = `ghl:meta:state:run:batteryB-${Date.now()}`;
+  const plant = (k) =>
+    fetch(BASE, {
+      method: "POST",
+      headers: { ...H, Prefer: "return=representation" },
+      body: JSON.stringify({ alert_key: k, check_id: "ghl_meta_state", severity: "run" }),
+    });
+  check("mw: fresh A planted", (await plant(p1)).ok);
+  check("mw: stale B planted (40 min old)", (await fetch(`${BASE}?alert_key=eq.${encodeURIComponent(p2)}`, {
+    method: "PATCH",
+    headers: H,
+    body: JSON.stringify({ created_at: new Date(Date.now() - 40 * 60000).toISOString() }),
+  })).ok);
+  process.env.DEADMAN_WATCHES = JSON.stringify([
+    { name: "Battery A", prefix: p1, route: "/api/battery-a" },
+    { name: "Battery B", prefix: p2, route: "/api/battery-b" },
+  ]);
+  try {
+    const { default: hmw } = await import("./api/deadman.js?mw=1");
+    const rm = mkRes();
+    await hmw({ method: "GET", url: "/api/deadman", headers: AUTH }, rm);
+    const w = rm.body?.watches ?? [];
+    check(
+      "mw: partial stale detected (A fresh, B stale)",
+      rm.body?.ok === false &&
+        Array.isArray(rm.body?.stale) &&
+        rm.body.stale.join(",") === "Battery B" &&
+        w.length === 2 &&
+        w.find((x) => x.name === "Battery A")?.stale === false &&
+        w.find((x) => x.name === "Battery B")?.stale === true,
+      JSON.stringify(rm.body)
+    );
+    check(
+      "mw: per-watch shape (name/route/marker/stale_min)",
+      w.every((x) => x.name && x.route && "newest_run_marker" in x && typeof x.stale_min !== "undefined"),
+      JSON.stringify(w)
+    );
+    // ALL-stale case: remove A's marker entirely
+    await fetch(`${BASE}?alert_key=eq.${encodeURIComponent(p1)}`, { method: "DELETE", headers: H });
+    const rm2 = mkRes();
+    await hmw({ method: "GET", url: "/api/deadman", headers: AUTH }, rm2);
+    check(
+      "mw: ALL stale (A never, B stale) -> pages with both names",
+      rm2.body?.ok === false && rm2.body?.stale?.length === 2 &&
+        ["Battery A", "Battery B"].every((n) => rm2.body.stale.includes(n)),
+      JSON.stringify(rm2.body?.stale)
+    );
+  } finally {
+    delete process.env.DEADMAN_WATCHES;
+    await fetch(`${BASE}?alert_key=eq.${encodeURIComponent(p1)}`, { method: "DELETE", headers: H });
+    await fetch(`${BASE}?alert_key=eq.${encodeURIComponent(p2)}`, { method: "DELETE", headers: H });
+  }
+  // deployed scope: the default (no seam env) watches tripwire + META guard
+  const src = readFileSync("./api/deadman.js", "utf8");
+  check(
+    "mw: default scope = tripwire + META guard prefixes",
+    src.includes('"ghl:state:run:"') && src.includes('"ghl:meta:state:run:"'),
+    "default WATCHES prefixes"
+  );
 }
 
 // ---------- 4) unreachable Supabase -> LOUD 500 ----------

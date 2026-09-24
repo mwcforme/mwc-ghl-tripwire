@@ -24,6 +24,29 @@ const ALERT_TO = (process.env.ALERT_TO ||
 const ALERT_FROM = process.env.ALERT_FROM || "v-islam.hetta@mwcforme.com";
 const STALE_MIN = 20;
 
+/** Dead-man scope: each entry is a 5-min cron whose run markers
+ *  (ops_alert_log ghl[:meta]:state:run:*) must stay fresh. The 2026-09-24
+ *  extension adds the META workflow guard to the original tripwire watch.
+ *  DEADMAN_WATCHES (JSON [{name,prefix,route}]) is a battery seam: it lets
+ *  the local battery point the dead-man at battery-owned marker prefixes
+ *  so partial-stale cases are deterministic (the deployed 5-min crons
+ *  otherwise keep writing fresh markers mid-test). */
+function parseWatches() {
+  if (process.env.DEADMAN_WATCHES) {
+    try {
+      const v = JSON.parse(process.env.DEADMAN_WATCHES);
+      if (Array.isArray(v) && v.every((x) => x && x.name && x.prefix)) return v;
+    } catch {
+      /* fall through to defaults */
+    }
+  }
+  return [
+    { name: "GHL tripwire", prefix: "ghl:state:run:", route: "/api/tripwire" },
+    { name: "META workflow guard", prefix: "ghl:meta:state:run:", route: "/api/meta-workflows" },
+  ];
+}
+const WATCHES = parseWatches();
+
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
@@ -115,15 +138,18 @@ export default async function handler(req, res) {
     "User-Agent": UA,
   };
 
-  // newest tripwire run marker — a probe crash must be LOUD, not a silent 200
-  let newest = null;
+  // newest run marker per watched 5-min cron — a probe crash must be LOUD,
+  // not a silent 200
+  const watches = [];
   try {
-    const r = await jfetch(
-      `${SUPABASE_URL}/rest/v1/ops_alert_log?select=alert_key,created_at&alert_key=like.ghl:state:run:*&order=created_at.desc&limit=1`,
-      { headers }
-    );
-    if (!r.ok || !Array.isArray(r.body)) throw new Error(`marker probe HTTP ${r.status}`);
-    newest = r.body[0] ?? null;
+    for (const w of WATCHES) {
+      const r = await jfetch(
+        `${SUPABASE_URL}/rest/v1/ops_alert_log?select=alert_key,created_at&alert_key=like.${encodeURIComponent(w.prefix)}*&order=created_at.desc&limit=1`,
+        { headers }
+      );
+      if (!r.ok || !Array.isArray(r.body)) throw new Error(`marker probe HTTP ${r.status} (${w.name})`);
+      watches.push({ ...w, newest: r.body[0] ?? null });
+    }
   } catch (e) {
     const err = String(e?.message ?? e).slice(0, 160);
     console.error(JSON.stringify({ event: "deadman_probe_failed", err }));
@@ -132,7 +158,7 @@ export default async function handler(req, res) {
       emailOk = await email(
         "[MWC] GHL deadman PROBE ERROR — cannot read run markers",
         [
-          "The dead-man's switch itself failed to read the tripwire run markers.",
+          "The dead-man's switch itself failed to read the watched run markers.",
           `Error: ${err}`,
           "",
           "What this means: liveness verification is degraded — check Vercel project mwc-ghl-tripwire (Supabase access, env) now.",
@@ -145,24 +171,44 @@ export default async function handler(req, res) {
     return res.json({ error: "marker probe failed", err, email_ok: emailOk });
   }
 
-  const { stale: isStale, staleMin } = computeStale(
-    newest ? Date.parse(newest.created_at) : null
-  );
+  const staleWatches = [];
+  const perWatch = [];
+  for (const w of watches) {
+    const { stale, staleMin } = computeStale(w.newest ? Date.parse(w.newest.created_at) : null);
+    perWatch.push({
+      name: w.name,
+      route: w.route,
+      newest_run_marker: w.newest?.created_at ?? null,
+      stale_min: staleMin == null ? null : Number(staleMin.toFixed(1)),
+      stale,
+    });
+    if (stale) staleWatches.push({ ...w, staleMin, newest: w.newest });
+  }
+
   let emailOk = null;
-  if (isStale) {
+  if (staleWatches.length) {
+    const lines = [
+      staleWatches.length === WATCHES.length
+        ? `ALL ${WATCHES.length} watched 5-min crons have stopped writing run markers`
+        : `${staleWatches.length} of ${WATCHES.length} watched 5-min crons stopped writing run markers: ${staleWatches.map((w) => w.name).join(", ")}`,
+    ];
+    for (const w of staleWatches) {
+      lines.push(
+        `— ${w.name} (${w.route}): last marker ${
+          w.newest ? w.newest.created_at + " (" + w.staleMin.toFixed(0) + " min ago)" : "NEVER"
+        } (threshold ${STALE_MIN} min)`
+      );
+    }
+    lines.push(
+      "",
+      "What this means: GHL monitoring is OFF for the stale watcher(s) right now — errors / workflow changes will not be detected until the cron resumes.",
+      "",
+      "Check: Vercel project mwc-ghl-tripwire -> crons (Settings -> Cron Jobs) and the function logs for the stale route(s). This hourly dead-man check keeps paging every hour until each resumes."
+    );
     try {
       emailOk = await email(
-        "[MWC] GHL tripwire DEAD-MAN alarm — 5-min cron not firing",
-        [
-          `The GHL tripwire's 5-minute cron has not written a run marker in ${
-            newest ? staleMin.toFixed(0) + " minutes" : "EVER"
-          } (threshold ${STALE_MIN} min).`,
-          "",
-          "What this means: GHL error monitoring is OFF right now — errors will not be detected until the cron resumes.",
-          newest ? `Last run marker: ${newest.created_at} (${newest.alert_key})` : "No run markers exist at all.",
-          "",
-          "Check: Vercel project mwc-ghl-tripwire -> crons (/api/tripwire every 5 min) and its function logs. This hourly dead-man check will keep paging every hour until the tripwire resumes.",
-        ].join("\n")
+        `[MWC] GHL DEAD-MAN alarm — ${staleWatches.map((w) => w.name).join(" + ")} not firing`,
+        lines.join("\n")
       );
     } catch (e) {
       console.error(JSON.stringify({ event: "dms_email_exception", err: String(e?.message ?? e).slice(0, 160) }));
@@ -171,11 +217,10 @@ export default async function handler(req, res) {
   }
   res.statusCode = 200;
   res.json({
-    ok: !isStale,
-    newest_run_marker: newest?.created_at ?? null,
-    stale_min: staleMin == null ? null : Number(staleMin.toFixed(1)),
-    stale: isStale,
-    paged: isStale, // condition detected (email attempt made); email_ok separate
+    ok: staleWatches.length === 0,
+    watches: perWatch,
+    stale: staleWatches.map((w) => w.name),
+    paged: staleWatches.length > 0, // condition detected (email attempt made); email_ok separate
     email_ok: emailOk,
   });
 }
