@@ -52,15 +52,41 @@ const UA =
   "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
 
 async function jfetch(url, opts = {}, timeoutMs = 15000) {
-  const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { ...opts, signal: ctl.signal });
-    const text = await res.text();
-    let body = null;
-    try { body = JSON.parse(text); } catch { body = text; }
-    return { status: res.status, ok: res.status >= 200 && res.status < 300, body, text };
-  } finally { clearTimeout(t); }
+  const attempt = async () => {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...opts, signal: ctl.signal });
+      const text = await res.text();
+      let body = null;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = text;
+      }
+      return { status: res.status, ok: res.status >= 200 && res.status < 300, body, text };
+    } catch (e) {
+      return { status: 0, ok: false, body: null, text: String(e?.message ?? e).slice(0, 160) };
+    } finally {
+      clearTimeout(t);
+    }
+  };
+  const first = await attempt();
+  const method = (opts.method || "GET").toUpperCase();
+  const retryable =
+    method === "GET" && !first.ok && (first.status === 0 || first.status === 429 || first.status >= 500);
+  let out = first;
+  if (retryable) {
+    await new Promise((r) => setTimeout(r, 500));
+    out = await attempt();
+    if (out.status !== 0) out = { ...out, retried: true };
+  }
+  // Transport-dead after retry must THROW, never return ok:false — the
+  // caller's guard() turns a throw into a FAIL leg (blindness counter);
+  // swallowing it here would read a dead dependency as a healthy leg
+  // (soft-blind: probes "ok" while nothing can be persisted or paged).
+  if (out.status === 0) throw new Error(`jfetch transport: ${out.text}`);
+  return out;
 }
 
 /** Pure staleness decision (exported for the battery). newestMs == null
@@ -87,6 +113,15 @@ async function gmailToken() {
   return r.ok ? r.body.access_token : null;
 }
 
+/** RFC 2047-encode a header value containing non-ASCII (Gmail mangles bare
+ *  UTF-8 header bytes — same trap as the tripwire's sendFindingEmail). */
+function mimeHeader(v) {
+  const s = String(v);
+  return /^[\x20-\x7e]*$/.test(s)
+    ? s
+    : "=?UTF-8?B?" + Buffer.from(s, "utf8").toString("base64") + "?=";
+}
+
 async function email(subject, text) {
   const token = await gmailToken();
   if (!token) { console.error(JSON.stringify({ event: "gmail_token_failed", subject })); return false; }
@@ -95,7 +130,7 @@ async function email(subject, text) {
     `To: ${ALERT_TO.join(", ")}`,
     `From: ${ALERT_FROM}`,
     `Content-Type: multipart/alternative; boundary=${boundary}`,
-    `Subject: ${subject}`,
+    `Subject: ${mimeHeader(subject)}`,
     "",
     `--${boundary}`,
     "Content-Type: text/plain; charset=UTF-8",

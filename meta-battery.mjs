@@ -244,6 +244,12 @@ check("email leg really disabled (no oauth at call time)", !process.env.GOOGLE_O
     "googleOAuth() pattern"
   );
   check("handler logs email_skip_no_oauth when unset", src.includes("email_skip_no_oauth"));
+  // RFC 2047: Gmail mangles bare UTF-8 in headers (live-verified 2026-09-24)
+  check(
+    "Subject header RFC 2047-encoded (mimeHeader)",
+    /function mimeHeader\(/.test(src) && src.includes("Subject: ${mimeHeader(f.subject)}"),
+    "mimeHeader wiring"
+  );
 }
 
 // ---------- 10) blindness arms at 2 (functional, self-healing) ----------

@@ -102,21 +102,41 @@ function log(obj) {
 }
 
 async function jfetch(url, opts = {}, timeoutMs = 15000) {
-  const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { ...opts, signal: ctl.signal });
-    const text = await res.text();
-    let body = null;
+  const attempt = async () => {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), timeoutMs);
     try {
-      body = JSON.parse(text);
-    } catch {
-      body = text;
+      const res = await fetch(url, { ...opts, signal: ctl.signal });
+      const text = await res.text();
+      let body = null;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = text;
+      }
+      return { status: res.status, ok: res.status >= 200 && res.status < 300, body, text };
+    } catch (e) {
+      return { status: 0, ok: false, body: null, text: String(e?.message ?? e).slice(0, 160) };
+    } finally {
+      clearTimeout(t);
     }
-    return { status: res.status, ok: res.status >= 200 && res.status < 300, body, text };
-  } finally {
-    clearTimeout(t);
+  };
+  const first = await attempt();
+  const method = (opts.method || "GET").toUpperCase();
+  const retryable =
+    method === "GET" && !first.ok && (first.status === 0 || first.status === 429 || first.status >= 500);
+  let out = first;
+  if (retryable) {
+    await new Promise((r) => setTimeout(r, 500));
+    out = await attempt();
+    if (out.status !== 0) out = { ...out, retried: true };
   }
+  // Transport-dead after retry must THROW, never return ok:false — the
+  // caller's guard() turns a throw into a FAIL leg (blindness counter);
+  // swallowing it here would read a dead dependency as a healthy leg
+  // (soft-blind: probes "ok" while nothing can be persisted or paged).
+  if (out.status === 0) throw new Error(`jfetch transport: ${out.text}`);
+  return out;
 }
 
 /** Tolerant timestamp parse — never NaN-silent. Returns ms epoch or null. */
@@ -326,6 +346,17 @@ async function gmailAccessToken(OA) {
   return res.ok ? res.body.access_token : null;
 }
 
+/** RFC 2047-encode a header value containing non-ASCII. Gmail's raw-send
+ *  layer mangles bare UTF-8 header bytes (estate-alert subjects carry "—"
+ *  and workflow names of any encoding — same trap verified live on the
+ *  META guard's metaver subject, 2026-09-24). */
+function mimeHeader(v) {
+  const s = String(v);
+  return /^[\x20-\x7e]*$/.test(s)
+    ? s
+    : "=?UTF-8?B?" + Buffer.from(s, "utf8").toString("base64") + "?=";
+}
+
 async function sendFindingEmail(f) {
   const OA = googleOAuth();
   if (!OA) {
@@ -341,7 +372,7 @@ async function sendFindingEmail(f) {
     `To: ${ALERT_TO.join(", ")}`,
     `From: ${ALERT_FROM}`,
     'Content-Type: multipart/alternative; boundary="mwcg"',
-    `Subject: ${f.subject}`,
+    `Subject: ${mimeHeader(f.subject)}`,
     "",
     "--mwcg",
     'Content-Type: text/html; charset=UTF-8',

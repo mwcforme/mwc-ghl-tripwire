@@ -177,5 +177,15 @@ check("computeStale: fresh (5 min) -> not stale", computeStale(Date.now() - 5 * 
   );
 }
 
+// ---------- 6) Subject header RFC 2047-encoded ----------
+{
+  const src = readFileSync("./api/deadman.js", "utf8");
+  check(
+    "deadman Subject header RFC 2047-encoded (mimeHeader)",
+    /function mimeHeader\(/.test(src) && src.includes("Subject: ${mimeHeader(subject)}"),
+    "mimeHeader wiring"
+  );
+}
+
 console.log("\n=== DEADMAN BATTERY: " + results.filter((r) => r[1]).length + "/" + results.length + " passed ===");
 process.exit(results.some((r) => !r[1]) ? 1 : 0);
