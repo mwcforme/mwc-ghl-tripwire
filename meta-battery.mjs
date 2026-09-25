@@ -16,6 +16,8 @@
  * 12  no query-param auth + header-only contract mirrored
  * 13  describe(): every finding kind produces 4-part lines + subject
  * 14  WATCH set is exactly the 3 Meta workflows (live-verified IDs)
+ * 15  recipients: route-scoped META_ALERT_TO override chain (techops off the
+ *     Meta guard only; tripwire/deadman keep the project-wide ALERT_TO)
  *
  * Run: node meta-battery.mjs   (same env as battery.mjs)
  */
@@ -322,6 +324,22 @@ check("email leg really disabled (no oauth at call time)", !process.env.GOOGLE_O
     "WATCH = exactly the 3 Meta workflow IDs (live-verified 2026-09-24)",
     WATCH_IDS.every((id) => src.includes(`"${id}"`)) && /02\. NON BOOKED META/.test(src),
     "WATCH literal IDs"
+  );
+}
+
+// ---------- 15) recipients: route-scoped META_ALERT_TO override chain ----------
+{
+  const src = readFileSync("./api/meta-workflows.js", "utf8");
+  check(
+    "ALERT_TO reads META_ALERT_TO first, then ALERT_TO (route-scoped override)",
+    /ALERT_TO = \(process\.env\.META_ALERT_TO \|\| process\.env\.ALERT_TO \|\|/.test(src),
+    "META_ALERT_TO || ALERT_TO || default chain"
+  );
+  check(
+    "tripwire + deadman do NOT read META_ALERT_TO (project-wide list only)",
+    !readFileSync("./api/tripwire.js", "utf8").includes("META_ALERT_TO") &&
+      !readFileSync("./api/deadman.js", "utf8").includes("META_ALERT_TO"),
+    "META_ALERT_TO must exist only in meta-workflows.js"
   );
 }
 

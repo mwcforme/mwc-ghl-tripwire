@@ -37,7 +37,11 @@ const PUBLIC = "https://services.leadconnectorhq.com";
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
-const ALERT_TO = (process.env.ALERT_TO ||
+/** Route-scoped recipients: META_ALERT_TO (this guard only) overrides the
+ *  project-wide ALERT_TO — techops stays on tripwire/deadman pages, OFF the
+ *  Meta lead-SLA pages (user request 2026-09-25; deployed META_ALERT_TO =
+ *  v-ihetta + v-islam). */
+const ALERT_TO = (process.env.META_ALERT_TO || process.env.ALERT_TO ||
   "techops@menswellnesscenters.com,v-ihetta@menswellnesscenters.com,v-islam.hetta@mwcforme.com")
   .split(",")
   .map((s) => s.trim())
