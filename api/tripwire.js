@@ -407,7 +407,11 @@ function page(check, fp, subject, lines) {
 }
 
 async function checkPlatform() {
-  const r = await jfetch(STATUSPAGE, { headers: { Accept: "application/json" } });
+  // 30s timeout (vs 15s default): statuspage.io's CDN is intermittently
+  // glacial — 24s+ responses observed 2026-09-29, which the 15s timeout
+  // counted as blind-leg FAILs (counter hit 7 while the route was fine).
+  // Vendor slowness must not read as blindness on an unauthenticated route.
+  const r = await jfetch(STATUSPAGE, { headers: { Accept: "application/json" } }, 30000);
   if (!r.ok) return { ok: false };
   const ind = r.body?.status?.indicator ?? "unknown";
   if (ind !== "none") {
@@ -643,6 +647,9 @@ async function guard(name, fn) {
     return { ok: false, error: err };
   }
 }
+
+export const maxDuration = 60; // leg B's 30s statuspage timeout + sequential legs
+// must fit inside the function budget on slow-CDN days (observed 2026-09-29).
 
 export default async function handler(req, res) {
   // Auth: fail-closed, header-only bearer. No query-param secret form.
