@@ -509,30 +509,48 @@ async function checkExecutions() {
   return { ok: true, rows: n };
 }
 
-/** Estate flip with NAMING: stores the published ID->name map in state so the
- *  alert says WHICH workflow appeared/vanished — the question this signal
- *  exists to answer. Values live in the severity column (type: text, no
- *  length cap — verified against the OpenAPI spec 2026-09-22). */
+/** Estate flip with NAMING + WHO/WHEN: stores the published ID->{name,updatedAt}
+ *  map in state so the alert says WHICH workflow appeared/vanished AND WHEN it
+ *  changed. WHO is "unknown" until a GHL token with audit-log scope exists —
+ *  /locations/audit-logs is the only editor-naming route and the location PIT
+ *  gets 403 (scope not granted, verified 2026-09-30). Values live in the
+ *  severity column (type: text, no length cap — verified against the OpenAPI
+ *  spec 2026-09-22). Pre-2026-09-30 state rows are bare id->name strings;
+ *  both shapes are accepted. */
+function fmtDate(iso) {
+  const d = iso ? new Date(iso) : null;
+  if (!d || Number.isNaN(d.getTime())) return "unknown";
+  return `${d.getUTCMonth() + 1}/${d.getUTCDate()}/${d.getUTCFullYear()}`;
+}
+
 async function checkEstate() {
   const r = await ghlPublic(`/workflows/?locationId=${LOC}`); // BARE params — limit 422s
   if (!r.ok || !Array.isArray(r.body?.workflows)) return { ok: false };
   const wfs = r.body.workflows;
   const pub = wfs.filter((w) => w.status === "published");
   const published = pub.length;
-  const idMap = Object.fromEntries(pub.map((w) => [w.id, w.name]));
+  const idMap = Object.fromEntries(
+    pub.map((w) => [w.id, { name: w.name, updatedAt: w.updatedAt ?? null }])
+  );
   const st = await getState("ghl:state:estate_published");
   const stMap = await getState("ghl:state:estate_map");
   if (st) {
     const prev = parseInt(st.value, 10);
     if (!Number.isNaN(prev) && published !== prev) {
-      // diff the ID sets to NAME the flipped workflows
+      // diff the ID sets to NAME the flipped workflows + attach when
       let names = "";
       try {
         const prevMap = JSON.parse(stMap?.value ?? "{}");
+        const nameOf = (e, id) => (e && typeof e === "object" ? e.name ?? id : e ?? id);
+        const dateOf = (e) => (e && typeof e === "object" ? fmtDate(e.updatedAt) : "unknown");
         const prevIds = new Set(Object.keys(prevMap));
         const nowIds = new Set(Object.keys(idMap));
-        const added = [...nowIds].filter((id) => !prevIds.has(id)).map((id) => idMap[id]);
-        const removed = [...prevIds].filter((id) => !nowIds.has(id)).map((id) => prevMap[id] ?? id);
+        const added = [...nowIds]
+          .filter((id) => !prevIds.has(id))
+          .map((id) => `${nameOf(idMap[id], id)}, unknown, ${fmtDate(idMap[id]?.updatedAt)}`);
+        const removed = [...prevIds]
+          .filter((id) => !nowIds.has(id))
+          .map((id) => `${nameOf(prevMap[id], id)}, unknown, ${dateOf(prevMap[id])}`);
         const parts = [];
         if (removed.length) parts.push("UNPUBLISHED/DELETED: " + removed.join(", "));
         if (added.length) parts.push("NEWLY PUBLISHED: " + added.join(", "));
@@ -543,9 +561,9 @@ async function checkEstate() {
       const fp = `${prev}-${published}`;
       if (await claimAlert("estate", fp, "alert")) {
         page("estate", fp, `[GHL] Published workflows ${prev} -> ${published}${names ? " — " + names.slice(1) : ""}`, [
-          `The live published-workflow count changed (${prev} -> ${published}; total ${wfs.length}).${names}`,
+          `The live published-workflow count changed (${prev} -> ${published}; total ${wfs.length}).${names} Each change is listed as "name, who, when" — who reads "unknown" until the audit-log-scoped GHL token is configured.`,
           "Impact: a production automation was published, unpublished, or deleted.",
-          "Evidence: public /workflows list, status split, ID-set diff vs stored baseline.",
+          "Evidence: public /workflows list, status split, ID-set diff vs stored baseline; when = workflow updatedAt.",
           "Check: GHL Automation -> Workflows; verify the change was intentional.",
         ]);
       }

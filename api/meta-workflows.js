@@ -319,6 +319,14 @@ async function sendFindingEmail(f) {
 
 /* ----------------------------------------------------------------- checks */
 
+/** M/D/YYYY from an ISO timestamp (UTC) — the "when" field of who/when
+ *  attribution in alert lines (user request 2026-09-30). */
+function fmtWhen(iso) {
+  const d = iso ? new Date(iso) : null;
+  if (!d || Number.isNaN(d.getTime())) return "unknown";
+  return `${d.getUTCMonth() + 1}/${d.getUTCDate()}/${d.getUTCFullYear()}`;
+}
+
 let findings = []; // RESET at the start of every invocation (warm containers)
 
 function page(check, fp, subject, lines) {
@@ -401,7 +409,7 @@ function describe(v, f, ctx) {
         check: "metaunpub",
         subject: `[GHL] META workflow NOT PUBLISHED: ${v.name} — status "${f.status}"`,
         lines: [
-          `Workflow "${v.name}" is in status "${f.status}" — it is NOT running (paused or reverted to draft).`,
+          `Workflow "${v.name}" is in status "${f.status}" — it is NOT running (paused or reverted to draft). Last touched ${fmtWhen(v.updatedAt)} (by unknown — audit-log-scoped token not configured).`,
           "Impact: Meta leads on this path receive no automated speed-to-lead / non-booked follow-up until re-published.",
           `Evidence: live status from the public /workflows list (id ${v.id}); expected "published". Re-pages every 6h while it persists.`,
           `Check: GHL Automation → Workflows → "${v.name}" → re-publish if unintentional (owner: @mwc-ghl-qa).`,
@@ -412,9 +420,9 @@ function describe(v, f, ctx) {
         check: "metaver",
         subject: `[GHL] META workflow edited: ${v.name} v${f.from} → v${f.to}`,
         lines: [
-          `Workflow "${v.name}" was saved to version ${f.to} (baseline was v${f.from}).`,
+          `Workflow "${v.name}" was saved to version ${f.to} (baseline was v${f.from}) — edited by unknown on ${fmtWhen(v.updatedAt)} (who is unavailable until the audit-log-scoped GHL token is configured).`,
           "Impact: someone changed the automation — verify the edit didn't break the Meta lead path (execution errors also trip the main tripwire within 5 min).",
-          `Evidence: version field on the public /workflows list (id ${v.id}); further edits within 6h are absorbed into this notice.`,
+          `Evidence: version + updatedAt fields on the public /workflows list (id ${v.id}); further edits within 6h are absorbed into this notice.`,
           `Check: GHL Automation → Workflows → "${v.name}" → version history (owner: @mwc-ghl-qa).`,
         ],
       };
