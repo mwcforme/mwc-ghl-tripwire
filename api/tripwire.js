@@ -19,6 +19,13 @@
  *      therefore carry the Needs Review deep link, which does name them.)
  *  E  executions     /workflow/executions rows appear (canary)        -> pages
  *  G  capture        booking_attribution_records stale in biz hours   -> pages
+ *     LIVENESS events only (portal_booking, track_generate_lead), per-event,
+ *     measured in BUSINESS hours. track_booking_complete is reported as
+ *     COVERAGE and never pages: 2026-10-27 it false-paged "capture DOWN /
+ *     leads lost" at 37.9h on that single event while portal_booking and
+ *     track_generate_lead were both <2h fresh and 21 bookings landed that
+ *     day. One sparse label is not a pipeline, and a max() across all three
+ *     made every label drift read as a total outage.
  *  I  estate flip    published workflow count changes                 -> pages
  *
  * REMOVED 2026-09-21 (user correction): F dispatch + H sendfail — Curve
@@ -67,7 +74,16 @@ const REVIEW_URL = `https://app.gohighlevel.com/v2/location/${LOC}/automation/wo
 
 // thresholds (mirror the locally-tested worker ghl_tripwire_watch.py)
 const T = {
-  CAPTURE_STALE_H: 24,
+  /** Capture liveness: BUSINESS hours of silence (ET Mon-Fri 08:00-18:00).
+   *  10 = one full business day, so a genuine outage pages by the end of the
+   *  first business day it covers, while a weekend gap (Sat 18:00 -> Mon
+   *  08:00 = 0 business hours) can never page. Wall-clock age was the wrong
+   *  unit: it made every weekend look like a 40h outage. */
+  CAPTURE_STALE_BH: 10,
+  /** An event that is quiet by volume (<5 rows in 7 days) cannot page: it
+   *  would permanently alarm on an event nobody writes any more. It is still
+   *  reported (newest + 7d count) in the run payload. */
+  CAPTURE_MIN_7D: 5,
   LEG_FAIL_ALERT_MIN: 60, // max one blindness email per leg per hour
   REPEAT_CAP_H: 6, // same condition instance re-pages at most 6h
   BIZ: { startHour: 8, endHour: 18 }, // America/New_York Mon-Fri
@@ -164,6 +180,23 @@ function bizHoursNow(now = new Date()) {
   const dow = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[parts.weekday] ?? 0;
   const hour = Number(parts.hour);
   return dow >= 1 && dow <= 5 && hour >= T.BIZ.startHour && hour < T.BIZ.endHour;
+}
+
+/** Minutes of BUSINESS time between two instants (ET Mon-Fri 08:00-18:00).
+ *  This is the unit capture staleness must be measured in: wall-clock age
+ *  counts nights and weekends as outage, so a Friday-evening break "ages"
+ *  40h by Monday 08:00 before a single business hour has actually been
+ *  missed. Sampled at 15 min — 672 samples for a 7-day window, cheap, and
+ *  exact enough for a 10-business-hour threshold. */
+function bizMinutesBetween(fromMs, toMs) {
+  if (fromMs == null) return Infinity;
+  const step = 15 * 60e3;
+  const start = Math.max(fromMs, toMs - 14 * 864e5); // cap the walk at 14d
+  let mins = 0;
+  for (let t = start; t < toMs; t += step) {
+    if (bizHoursNow(new Date(t))) mins += 15;
+  }
+  return mins;
 }
 
 /* -------------------------------------------------------------- supabase */
@@ -574,29 +607,86 @@ async function checkEstate() {
   return { ok: true, published, total: wfs.length };
 }
 
-async function checkCapture() {
-  const r = await sb().get(
-    `booking_attribution_records?select=event,created_at&order=created_at.desc&limit=100`
-  );
-  if (!r.ok || !Array.isArray(r.body) || !r.body.length) return { ok: false };
-  const watch = ["portal_booking", "track_generate_lead", "track_booking_complete"];
-  const byEvent = {};
-  for (const row of r.body) byEvent[row.event] ??= row.created_at;
-  let worst = 0;
-  for (const ev of watch) {
-    if (byEvent[ev]) worst = Math.max(worst, ageH(tsMs(byEvent[ev])) ?? 0);
+/** Events whose freshness PROVES the capture pipeline is alive. Both are
+ *  written server-side on every booking / lead. */
+const CAPTURE_LIVENESS = ["portal_booking", "track_generate_lead"];
+/** Events reported for visibility but never allowed to page. A per-booking
+ *  label that another writer can absorb is a SHAPE signal, not availability:
+ *  it went 54/week -> 3/week on 2026-10-18 while bookings kept landing. */
+const CAPTURE_COVERAGE = ["track_booking_complete"];
+
+/** Pure decision seam (unit-tested offline, no network/env).
+ *  obs: [{ event, newest: iso|null, n7d: number }] -> { stale: [...], coverage: [...] } */
+function captureVerdict(obs, nowMs) {
+  const stale = [];
+  const coverage = [];
+  for (const o of obs || []) {
+    const newestMs = tsMs(o.newest);
+    const wallH = newestMs == null ? null : (nowMs - newestMs) / 3.6e6;
+    const bh = bizMinutesBetween(newestMs, nowMs) / 60;
+    const liveByVolume = (o.n7d ?? 0) >= T.CAPTURE_MIN_7D;
+    const row = { event: o.event, newest: o.newest ?? null, wallH, bh, n7d: o.n7d ?? 0 };
+    if (CAPTURE_COVERAGE.includes(o.event)) coverage.push(row);
+    /* A quiet-by-volume event cannot page — it would alarm forever on a
+       label nobody writes. It still shows up in `coverage`/`observed`. */
+    else if (liveByVolume && bh > T.CAPTURE_STALE_BH) stale.push(row);
   }
-  if (worst > T.CAPTURE_STALE_H && bizHoursNow()) {
-    if (await claimAlert("capture", "stale", "alert")) {
-      page("capture", "stale", "[MWC] Booking capture pipeline DOWN — no attribution events", [
-        `No booking attribution events (portal_booking / track_*) for ${worst.toFixed(1)}h during US business hours.`,
-        "Impact: bookings/forms are not being captured at all — leads lost.",
-        "Evidence: Supabase booking_attribution_records newest per event.",
-        "Check: booking app + GHL capture path (mwc-admin conversion ops).",
+  return { stale, coverage };
+}
+
+async function checkCapture() {
+  const nowMs = Date.now();
+  const iso7 = new Date(nowMs - 7 * 864e5).toISOString();
+  const obs = [];
+  for (const ev of [...CAPTURE_LIVENESS, ...CAPTURE_COVERAGE]) {
+    /* Per-event lookups, not one "newest 100 rows" window: a busier event
+       could push a sparse one out of the window and manufacture staleness. */
+    const newest = await sb().get(
+      `booking_attribution_records?select=created_at&event=eq.${encodeURIComponent(ev)}&order=created_at.desc&limit=1`
+    );
+    if (!newest.ok || !Array.isArray(newest.body)) return { ok: false };
+    const vol = await sb().get(
+      `booking_attribution_records?select=id&event=eq.${encodeURIComponent(ev)}&created_at=gte.${iso7}&limit=${T.CAPTURE_MIN_7D}`
+    );
+    if (!vol.ok || !Array.isArray(vol.body)) return { ok: false };
+    obs.push({ event: ev, newest: newest.body[0]?.created_at ?? null, n7d: vol.body.length });
+  }
+
+  const v = captureVerdict(obs, nowMs);
+  if (v.stale.length && bizHoursNow()) {
+    /* Fingerprint carries the failing SET: the same outage re-pages at most
+       every REPEAT_CAP_H, but a different event failing is new information
+       and must page immediately. */
+    const fp = "stale:" + v.stale.map((s) => s.event).sort().join("+");
+    if (await claimAlert("capture", fp, "alert")) {
+      const names = v.stale.map((s) => s.event).join(" / ");
+      const detail = v.stale
+        .map((s) => `${s.event}: newest ${s.newest} (${s.bh.toFixed(1)} business-hours, ${s.wallH.toFixed(1)}h wall, >=${s.n7d} rows/7d)`)
+        .join("; ");
+      page("capture", fp, `[MWC] Booking capture pipeline DOWN — no ${names} rows`, [
+        `No ${names} rows in booking_attribution_records for ${v.stale
+          .map((s) => s.bh.toFixed(1))
+          .join(" / ")} business-hours (US business hours only).`,
+        "Impact: new bookings/form submissions are not reaching the attribution ledger — leads lost.",
+        `Evidence: ${detail}.`,
+        "Check: booking app -> /api/book -> mwc-admin /api/attribution (conversion ops).",
       ]);
     }
   }
-  return { ok: true, worstAgeH: worst };
+
+  const worst = v.stale.length
+    ? Math.max(...v.stale.map((s) => s.wallH ?? 0))
+    : Math.max(0, ...CAPTURE_LIVENESS.map((ev) => {
+        const o = obs.find((x) => x.event === ev);
+        const m = tsMs(o?.newest);
+        return m == null ? 0 : (nowMs - m) / 3.6e6;
+      }));
+  return {
+    ok: true,
+    worstAgeH: worst,
+    stale: v.stale.map((s) => s.event),
+    coverage: v.coverage.map((c) => ({ event: c.event, wallH: c.wallH, n7d: c.n7d })),
+  };
 }
 
 /* --------------------------------------------------------------- blindness */
@@ -760,6 +850,8 @@ export default async function handler(req, res) {
       estate_published: results.estate?.published,
       estate_total: results.estate?.total,
       capture_worst_age_h: results.capture?.worstAgeH,
+      capture_stale: results.capture?.stale,
+      capture_coverage: results.capture?.coverage,
     },
     findings: findings.map((f) => f.check),
     alerts_sent: sent,
@@ -777,5 +869,9 @@ export const _internals = {
   setState,
   getState,
   bizHoursNow,
+  bizMinutesBetween,
+  captureVerdict,
+  CAPTURE_LIVENESS,
+  THRESHOLDS: T,
   setDry: (v) => (DRY = v),
 };
