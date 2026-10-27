@@ -681,6 +681,24 @@ async function checkCapture() {
         const m = tsMs(o?.newest);
         return m == null ? 0 : (nowMs - m) / 3.6e6;
       }));
+  /* Durable receipt of what this rule saw on this tick (state value, not a
+     log line): proves the deployed handler evaluated capture and lets the
+     next reader diff the observed shape without an email. No-op in dry. */
+  await setState(
+    "ghl:state:capture_last",
+    JSON.stringify({
+      rule: "bh10/v2",
+      ts: new Date(nowMs).toISOString(),
+      stale: v.stale.map((s) => s.event),
+      stale_bh: v.stale.map((s) => Number((s.bh ?? 0).toFixed(2))),
+      coverage: v.coverage.map((c) => ({
+        e: c.event,
+        wall_h: Number((c.wallH ?? 0).toFixed(2)),
+        n7d: c.n7d,
+      })),
+    })
+  );
+
   return {
     ok: true,
     worstAgeH: worst,
